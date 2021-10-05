@@ -314,6 +314,12 @@ type vma struct {
 	// If hint is non-empty, it is a description of the vma printed in
 	// /proc/[pid]/maps. hint takes priority over id.MappedName().
 	hint string
+
+	// lastFault records the last address that was paged faulted. It hints at
+	// which direction addresses in this vma are being accessed.
+	//
+	// This field is protected by mm.activeMu.
+	lastFault hostarch.Addr
 }
 
 const (
