@@ -179,7 +179,7 @@ func (t *Tsetattrclunk) handle(cs *connState) message {
 		// This might be technically incorrect, as it's possible that
 		// there were multiple links and you can still change the
 		// corresponding inode information.
-		if ref.isDeleted() {
+		if !cs.server.options.SetAttrOnDeleted && ref.isDeleted() {
 			return unix.EINVAL
 		}
 
@@ -914,7 +914,7 @@ func (t *Tsetattr) handle(cs *connState) message {
 		// This might be technically incorrect, as it's possible that
 		// there were multiple links and you can still change the
 		// corresponding inode information.
-		if ref.isDeleted() {
+		if !cs.server.options.SetAttrOnDeleted && ref.isDeleted() {
 			return unix.EINVAL
 		}
 
@@ -947,7 +947,7 @@ func (t *Tallocate) handle(cs *connState) message {
 		}
 
 		// We don't allow allocate on files that have been deleted.
-		if ref.isDeleted() {
+		if !cs.server.options.AllocateOnDeleted && ref.isDeleted() {
 			return unix.EINVAL
 		}
 
