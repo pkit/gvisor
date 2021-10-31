@@ -145,6 +145,19 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, hardwareG
 			continue
 		}
 
+		// Collect data from the ARP table
+		dump, err := netlink.NeighList(iface.Index, 0)
+		var neighbors[] boot.Neighbor
+		for _, n := range dump {
+			// there are only two "good" states NUD_PERMANENT and NUD_REACHABLE
+			// but NUD_REACHABLE is fully dynamic and will be re-probed anyway
+			if n.State == netlink.NUD_PERMANENT {
+				log.Debugf("Copying a static ARP entry: %+v %+v", n.IP, n.HardwareAddr)
+				// no flags are copied because Stack.AddStaticNeighbor does not support flags anyway
+				neighbors = append(neighbors, boot.Neighbor{IP: n.IP, HardwareAddr: n.HardwareAddr})
+			}
+		}
+
 		allAddrs, err := iface.Addrs()
 		if err != nil {
 			return fmt.Errorf("fetching interface addresses for %q: %w", iface.Name, err)
@@ -203,6 +216,7 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, hardwareG
 			RXChecksumOffload: rxChecksumOffload,
 			NumChannels:       numNetworkChannels,
 			QDisc:             qDisc,
+			Neighbors:         neighbors,
 		}
 
 		// Get the link for the interface.
