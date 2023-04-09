@@ -494,7 +494,7 @@ type ControlFDImpl interface {
 	// On the server, BindAt has a write concurrency guarantee.
 	BindAt(name string, sockType uint32, mode linux.FileMode, uid UID, gid GID) (*ControlFD, linux.Statx, *BoundSocketFD, int, error)
 
-	// UnlinkAt the file identified by name in this directory.
+	// Unlink the file identified by name in this directory.
 	//
 	// Flags are Linux unlinkat(2) flags.
 	//
@@ -508,6 +508,15 @@ type ControlFDImpl interface {
 	//
 	// On the server, RenameAt has a global concurrency guarantee.
 	RenameAt(oldName string, newDir ControlFDImpl, newName string) error
+
+	// RenameAt2 renames a given file to a new name in a potentially new directory, with support for rename flags.
+	//
+	// oldName must be a name relative to this file, which must be a directory.
+	// newName is a name relative to newDir.
+	// supported flags are: RENAME_NOREPLACE, RENAME_EXCHANGE
+	//
+	// On the server, RenameAt2 has a global concurrency guarantee.
+	RenameAt2(oldName string, newDir ControlFDImpl, newName string, flags uint32) error
 
 	// Renamed is called to notify the FD implementation that the file has been
 	// renamed. FD implementation may update its state accordingly.

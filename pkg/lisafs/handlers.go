@@ -78,6 +78,7 @@ var handlers = [...]RPCHandler{
 	BindAt:       BindAtHandler,
 	Listen:       ListenHandler,
 	Accept:       AcceptHandler,
+	RenameAt2:    RenameAt2Handler,
 }
 
 // ErrorHandler handles Error message.
@@ -1313,6 +1314,106 @@ func RenameAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint3
 		}
 		return nil
 	})
+}
+
+// RenameAt2Handler handles the RenameAt2 RPC.
+func RenameAt2Handler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
+	if c.readonly {
+		return 0, unix.EROFS
+	}
+	var req RenameAtReq2
+	if _, ok := req.CheckedUnmarshal(comm.PayloadBuf(payloadLen)); !ok {
+		return 0, unix.EIO
+	}
+
+	oldName := string(req.OldName)
+	if err := checkSafeName(oldName); err != nil {
+		return 0, err
+	}
+	newName := string(req.NewName)
+	if err := checkSafeName(newName); err != nil {
+		return 0, err
+	}
+
+	oldDir, err := c.lookupControlFD(req.OldDir)
+	if err != nil {
+		return 0, err
+	}
+	defer oldDir.DecRef(nil)
+	newDir, err := c.lookupControlFD(req.NewDir)
+	if err != nil {
+		return 0, err
+	}
+	defer newDir.DecRef(nil)
+	flags := uint32(req.Flags)
+
+	if !oldDir.IsDir() || !newDir.IsDir() {
+		return 0, unix.ENOTDIR
+	}
+
+	// Hold RenameMu for writing during rename, this is important.
+	return 0, oldDir.safelyGlobal(func() error {
+		if oldDir.node.isDeleted() || newDir.node.isDeleted() {
+			return unix.EINVAL
+		}
+
+		if oldDir.node == newDir.node && oldName == newName {
+			// Nothing to do.
+			return nil
+		}
+
+		// Attempt the actual rename.
+		if err := oldDir.impl.RenameAt2(oldName, newDir.impl, newName, flags); err != nil {
+			return err
+		}
+
+		// Successful, so update the node tree. Note that since we have global
+		// concurrency guarantee here, the node tree can not be modified
+		// concurrently in any way.
+
+		exchange := flags&linux.RENAME_EXCHANGE != 0
+
+		// First detach the renamed and replaced nodes from the node tree.
+		replaced := detachRenameNode(newDir.node, newName)
+		renamed := detachRenameNode(oldDir.node, oldName)
+
+		// Now move renamed and replaced nodes to their right positions.
+		if renamed != nil {
+			attachRenamedNode(renamed, newDir.node, newName)
+		}
+		if replaced != nil {
+			if exchange {
+				attachRenamedNode(replaced, oldDir.node, oldName)
+			} else {
+				replaced.opMu.Lock()
+				replaced.markDeletedRecursive()
+				replaced.opMu.Unlock()
+			}
+		}
+		return nil
+	})
+}
+
+func detachRenameNode(dir *Node, name string) *Node {
+	dir.childrenMu.Lock()
+	removed := dir.removeChildLocked(name)
+	dir.childrenMu.Unlock()
+	// Decref parent, because now this node will hold a ref on a new parent.
+	if removed != nil {
+		removed.parent.DecRef(nil)
+	}
+	return removed
+}
+
+func attachRenamedNode(child, parent *Node, name string) {
+	child.parent = parent
+	child.parent.IncRef()
+	child.name = name
+	parent.childrenMu.Lock()
+	parent.insertChildLocked(name, child)
+	parent.childrenMu.Unlock()
+	// Now update all FDs under the subtree rooted at renamed.
+	notifyRenameRecursive(child)
 }
 
 func notifyRenameRecursive(n *Node) {

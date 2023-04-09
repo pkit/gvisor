@@ -168,7 +168,16 @@ var allowedSyscalls = seccomp.SyscallRules{
 			seccomp.EqualTo(unix.MSG_DONTWAIT | unix.MSG_TRUNC | unix.MSG_PEEK),
 		},
 	},
-	unix.SYS_RENAMEAT:        {},
+	unix.SYS_RENAMEAT: {},
+	unix.SYS_RENAMEAT2: []seccomp.Rule{
+		{
+			seccomp.MatchAny{},
+			seccomp.MatchAny{},
+			seccomp.MatchAny{},
+			seccomp.MatchAny{},
+			seccomp.MaskedEqual(unix.RENAME_WHITEOUT, 0),
+		},
+	},
 	unix.SYS_RESTART_SYSCALL: {},
 	// May be used by the runtime during panic().
 	unix.SYS_RT_SIGACTION:   {},

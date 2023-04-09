@@ -26,6 +26,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fspath"
+	"gvisor.dev/gvisor/pkg/lisafs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
 	"gvisor.dev/gvisor/pkg/sentry/fsmetric"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -1325,14 +1326,29 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		return err
 	}
 
-	if opts.Flags&^linux.RENAME_NOREPLACE != 0 {
-		return linuxerr.EINVAL
+	renameat2Supported := fs.client.IsSupported(lisafs.RenameAt2)
+
+	if renameat2Supported {
+		// for now only RENAME_NOREPLACE and RENAME_EXCHANGE are supported
+		if opts.Flags&^(linux.RENAME_NOREPLACE|linux.RENAME_EXCHANGE) != 0 {
+			return linuxerr.EINVAL
+		}
+		// cannot specify both RENAME_NOREPLACE and RENAME_EXCHANGE
+		if opts.Flags&(linux.RENAME_NOREPLACE|linux.RENAME_EXCHANGE) == (linux.RENAME_NOREPLACE | linux.RENAME_EXCHANGE) {
+			return linuxerr.EINVAL
+		}
+	} else {
+		if opts.Flags&^linux.RENAME_NOREPLACE != 0 {
+			return linuxerr.EINVAL
+		}
+		if fs.opts.interop == InteropModeShared && opts.Flags&linux.RENAME_NOREPLACE != 0 {
+			// Requires 9P support to synchronize with other remote filesystem
+			// users.
+			return linuxerr.EINVAL
+		}
 	}
-	if fs.opts.interop == InteropModeShared && opts.Flags&linux.RENAME_NOREPLACE != 0 {
-		// Requires 9P support to synchronize with other remote filesystem
-		// users.
-		return linuxerr.EINVAL
-	}
+
+	exchange := opts.Flags&linux.RENAME_EXCHANGE != 0
 
 	newName := rp.Component()
 	if newName == "." || newName == ".." {
@@ -1393,7 +1409,8 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 			}
 		}
 	} else {
-		if opts.MustBeDir || rp.MustBeDir() {
+		// RENAME_EXCHANGE supports exchange between different node types
+		if (opts.MustBeDir || rp.MustBeDir()) && !exchange {
 			return linuxerr.ENOTDIR
 		}
 	}
@@ -1443,11 +1460,17 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 
 	// Update the remote filesystem.
 	if !renamed.isSynthetic() {
-		if err := oldParent.rename(ctx, oldName, newParent, newName); err != nil {
+		var err error
+		if renameat2Supported {
+			err = oldParent.rename2(ctx, oldName, newParent, newName, opts.Flags)
+		} else {
+			err = oldParent.rename(ctx, oldName, newParent, newName)
+		}
+		if err != nil {
 			vfsObj.AbortRenameDentry(&renamed.vfsd, replacedVFSD)
 			return err
 		}
-	} else if replaced != nil && !replaced.isSynthetic() {
+	} else if replaced != nil && !replaced.isSynthetic() && !exchange {
 		// We are replacing an existing real file with a synthetic one, so we
 		// need to unlink the former.
 		flags := uint32(0)
@@ -1468,26 +1491,52 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		defer oldParent.childrenMu.Unlock()
 	}
 
-	vfsObj.CommitRenameReplaceDentry(ctx, &renamed.vfsd, replacedVFSD)
-	if replaced != nil {
-		replaced.setDeleted()
-		if replaced.isSynthetic() {
-			newParent.syntheticChildren--
-			replaced.decRefNoCaching()
-		}
-		ds = appendDentry(ds, replaced)
-		// Remove the replaced entry from its parent's cache.
-		delete(newParent.children, newName)
+	if exchange {
+		vfsObj.CommitRenameExchangeDentry(&renamed.vfsd, replacedVFSD)
+	} else {
+		vfsObj.CommitRenameReplaceDentry(ctx, &renamed.vfsd, replacedVFSD)
 	}
-	oldParent.cacheNegativeLookupLocked(oldName) // +checklocksforce: oldParent.childrenMu is held if oldParent != newParent.
-	if renamed.isSynthetic() {
-		oldParent.syntheticChildren--
+
+	if !exchange {
+		if replaced != nil {
+			replaced.setDeleted()
+			if replaced.isSynthetic() {
+				newParent.syntheticChildren--
+				replaced.decRefNoCaching()
+			}
+			ds = appendDentry(ds, replaced)
+			// Remove the replaced entry from its parent's cache.
+			delete(newParent.children, newName)
+		}
+		oldParent.cacheNegativeLookupLocked(oldName) // +checklocksforce: oldParent.childrenMu is held if oldParent != newParent.
+	}
+	if renamed.isSynthetic() && !(exchange && replaced.isSynthetic()) {
+		oldParent.syntheticChildren-- // +checklocksforce: oldParent.childrenMu is held if oldParent != newParent.
 		newParent.syntheticChildren++
+	}
+	if exchange && replaced.isSynthetic() && !renamed.isSynthetic() {
+		newParent.syntheticChildren--
+		oldParent.syntheticChildren++ // +checklocksforce: oldParent.childrenMu is held if oldParent != newParent.
+	}
+	// if we do exchange and both are synthetic, no need to play with increments at all
+	if !(exchange && replaced.isSynthetic() && renamed.isSynthetic()) {
+		if renamed.isSynthetic() {
+			oldParent.syntheticChildren-- // +checklocksforce: oldParent.childrenMu is held if oldParent != newParent.
+			newParent.syntheticChildren++
+		}
+		if exchange && replaced.isSynthetic() {
+			newParent.syntheticChildren--
+			oldParent.syntheticChildren++ // +checklocksforce: oldParent.childrenMu is held if oldParent != newParent.
+		}
 	}
 	// We have d.opMu for writing, so no need to check for existence of a
 	// child with the given name. We could not have raced.
 	newParent.cacheNewChildLocked(renamed, newName)
-	oldParent.decRefNoCaching()
+	if exchange {
+		oldParent.cacheNewChildLocked(replaced, oldName) // +checklocksforce: oldParent.childrenMu is held if oldParent != newParent.
+	} else {
+		oldParent.decRefNoCaching()
+	}
 	if oldParent != newParent {
 		ds = appendDentry(ds, newParent)
 		ds = appendDentry(ds, oldParent)
@@ -1497,11 +1546,21 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	if renamed.cachedMetadataAuthoritative() {
 		renamed.touchCtime()
 	}
+	if exchange && replaced.cachedMetadataAuthoritative() {
+		replaced.touchCtime()
+	}
 	if oldParent.cachedMetadataAuthoritative() {
-		oldParent.clearDirentsLocked()
+		oldParent.clearDirentsLocked() // +checklocksforce: oldParent.childrenMu is held if oldParent != newParent.
 		oldParent.touchCMtime()
-		if renamed.isDir() {
-			oldParent.decLinks()
+		if exchange {
+			if replaced.isDir() && !renamed.isDir() {
+				// Increase the link count if we did not exchange with another directory.
+				oldParent.incLinks()
+			}
+		} else {
+			if renamed.isDir() {
+				oldParent.decLinks()
+			}
 		}
 	}
 	if newParent.cachedMetadataAuthoritative() {
@@ -1513,6 +1572,9 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		}
 	}
 	vfs.InotifyRename(ctx, &renamed.watches, &oldParent.watches, &newParent.watches, oldName, newName, renamed.isDir())
+	if exchange {
+		vfs.InotifyRename(ctx, &replaced.watches, &newParent.watches, &oldParent.watches, newName, oldName, replaced.isDir())
+	}
 	return nil
 }
 

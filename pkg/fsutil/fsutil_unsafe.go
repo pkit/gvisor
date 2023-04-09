@@ -88,6 +88,40 @@ func RenameAt(oldDirFD int, oldName string, newDirFD int, newName string) error 
 	return nil
 }
 
+// RenameAt2 is a convenience wrapper to make the renameat2(2) syscall. It
+// additionally handles empty names.
+func RenameAt2(oldDirFD int, oldName string, newDirFD int, newName string, flags uint32) error {
+	var oldNamePtr unsafe.Pointer
+	if oldName != "" {
+		nameBytes, err := unix.BytePtrFromString(oldName)
+		if err != nil {
+			return err
+		}
+		oldNamePtr = unsafe.Pointer(nameBytes)
+	}
+	var newNamePtr unsafe.Pointer
+	if newName != "" {
+		nameBytes, err := unix.BytePtrFromString(newName)
+		if err != nil {
+			return err
+		}
+		newNamePtr = unsafe.Pointer(nameBytes)
+	}
+
+	if _, _, errno := unix.Syscall6(
+		unix.SYS_RENAMEAT2,
+		uintptr(oldDirFD),
+		uintptr(oldNamePtr),
+		uintptr(newDirFD),
+		uintptr(newNamePtr),
+		uintptr(flags),
+		0); errno != 0 {
+
+		return syserr.FromHost(errno).ToError()
+	}
+	return nil
+}
+
 // ParseDirents parses dirents from buf. buf must have been populated by
 // getdents64(2) syscall. It calls the handleDirent callback for each dirent.
 func ParseDirents(buf []byte, handleDirent func(ino uint64, off int64, ftype uint8, name string, reclen uint16) bool) {

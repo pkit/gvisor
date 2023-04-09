@@ -470,6 +470,18 @@ func (d *dentry) rename(ctx context.Context, oldName string, newParent *dentry, 
 }
 
 // Precondition: !d.isSynthetic().
+func (d *dentry) rename2(ctx context.Context, oldName string, newParent *dentry, newName string, flags uint32) error {
+	switch dt := d.impl.(type) {
+	case *lisafsDentry:
+		return dt.controlFD.RenameAt2(ctx, oldName, newParent.impl.(*lisafsDentry).controlFD.ID(), newName, flags)
+	case *directfsDentry:
+		return fsutil.RenameAt2(dt.controlFD, oldName, newParent.impl.(*directfsDentry).controlFD, newName, flags)
+	default:
+		panic("unknown dentry implementation")
+	}
+}
+
+// Precondition: !d.isSynthetic().
 func (d *dentry) statfs(ctx context.Context) (linux.Statfs, error) {
 	switch dt := d.impl.(type) {
 	case *lisafsDentry:
